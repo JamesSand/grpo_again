@@ -13,9 +13,6 @@ from datasets import load_dataset
 from reward_func import *
 import wandb
 
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
-
 SYSTEM_PROMPT = "Let's think step by step and output the final answer within \\boxed{}."
 
 class GSM8KDataset(Dataset):
