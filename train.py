@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-# from torch.utils.tensorboard import SummaryWriter
 from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 from copy import deepcopy
 from datasets import load_dataset
@@ -56,8 +55,6 @@ class GSM8KDataset(Dataset):
     def __len__(self):
         return len(self.data)
     
-    
-    
     def __getitem__(self, index):
         sample = self.data[index]
         # prompt = self.tokenizer.apply_chat_template(sample['prompt'], tokenize=False, add_generation_prompt=True)
@@ -66,6 +63,26 @@ class GSM8KDataset(Dataset):
         prompt = sample['question']
         return {'prompt': prompt, 'answer': answer}
 
+
+class GRPOArguments:
+    
+    output_dir = './output'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    lr = 1e-6
+    save_steps = 100
+    epoch = 3
+    num_generations = 4 # number of samples in a group
+    max_prompt_length = 512 # maximum input length
+    max_generate_length = 1024 # maximum output length
+    reward_weights : List[float] = None # weights for rewards (multiple reward functions)
+    beta = 1e-2 # KL divergence coefficient, 0 to ignore KL divergence (no reference model)
+    clip_eps = 0.2
+    gradient_accumulation_steps = 2 # gradient accumulation
+    num_iterations = 1 # number of training iterations per sample collection
+    batch_size = 1
+    use_wandb = False # whether to use wandb for logging
+    wandb_project = "grpo-training" # wandb project name
+    wandb_run_name = None # wandb run name, default to None (auto-generated)
 
 @dataclass
 class Samples:
@@ -79,26 +96,6 @@ class Samples:
     response_length: int
 
 
-class GRPOArguments:
-    
-    output_dir = './output'
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    lr = 1e-6
-    save_steps = 100
-    epoch = 3
-    num_generations = 4 # 组内样本数
-    max_prompt_length = 512 # 最大输入长度
-    max_generate_length = 1024 # 最大输出长度
-    reward_weights : List[float] = None # 奖励的权重（多个奖励函数）
-    beta = 1e-2 # KL散度的系数，为0则忽略KL散度，即不使用参考模型
-    clip_eps = 0.2
-    gradient_accumulation_steps = 2 # 梯度累加
-    num_iterations = 1 # 采样一次样本训练模型轮数
-    batch_size = 1
-    use_wandb = False # 是否使用wandb记录
-    wandb_project = "grpo-training" # wandb项目名称
-    wandb_run_name = None # wandb运行名称，默认自动生成
-
 class GRPOTrainer:
     def __init__(self,
         model = None,
@@ -110,16 +107,18 @@ class GRPOTrainer:
         reward_tokenizers = None):
 
         self.args = args
-        # 加载模型
+        # Load model
         if isinstance(model, str):
             model = AutoModelForCausalLM.from_pretrained(model)
         self.model = model.to(self.args.device)
         
-        # 是否使用参考模型
+        # Whether to use reference model
         self.ref_model = None
         if self.args.beta != 0.0:
             self.ref_model = deepcopy(model)
             self.ref_model.eval()
+            # Keep reference model on CPU to save GPU memory, will move to GPU when needed
+            self.ref_model = self.ref_model.cpu()
     
         
         if isinstance(tokenizer, str):
@@ -131,7 +130,7 @@ class GRPOTrainer:
             reward_funcs = [reward_funcs]
         
         for i, reward_func in enumerate(reward_funcs):
-            # 如果奖励函数为字符串，表示使用的是奖励模型，则加载模型
+            # If reward function is a string, it indicates using a reward model, then load the model
             if isinstance(reward_func, str):
                 reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
                     reward_func, num_labels=1).to(self.args.device)
@@ -162,13 +161,13 @@ class GRPOTrainer:
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         
-        # 缓存已经生成的数据的一个批次的数据，可供模型多次训练迭代，无需重新生成
+        # Cache one batch of generated data for multiple training iterations without regeneration
         self.input_buffer = [None] * self.args.gradient_accumulation_steps
         
-        # 模型更新的次数
+        # Number of model updates
         self.update_steps = 0
         
-        # 初始化wandb
+        # Initialize wandb
         if self.args.use_wandb:
             wandb.init(
                 project=self.args.wandb_project,
@@ -248,7 +247,7 @@ class GRPOTrainer:
 
         return samples_list
     
-    # 生成经验(优势、token的概率分布)
+    # Generate experiences (advantages, token probability distributions)
     def generate_experiences(self, inputs):
         
         self.model.eval()
@@ -274,20 +273,25 @@ class GRPOTrainer:
             batch_action_mask.append(action_mask)
             
             with torch.no_grad():
-                # 计算策略模型输出token的概率
+                # Calculate token probabilities from policy model
                 old_action_log_probs = self.get_action_log_probs(self.model, prompt_response_ids, attention_mask, num_actions)
                 batch_old_action_log_probs.append(old_action_log_probs)
                 
-                # 是否使用参考模型
+                # Whether to use reference model
                 if self.ref_model:
-                    #计算参考模型输出token的概率
+                    # Move reference model to GPU for inference
+                    self.ref_model = self.ref_model.to(self.args.device)
+                    # Calculate token probabilities from reference model
                     ref_action_log_probs = self.get_action_log_probs(self.ref_model, prompt_response_ids, attention_mask, num_actions)
                     batch_ref_action_log_probs.append(ref_action_log_probs)
+                    # Move reference model back to CPU to save GPU memory
+                    self.ref_model = self.ref_model.cpu()
+                    torch.cuda.empty_cache()
                 
-                # 存储各个奖励函数在一个group内各个响应的奖励
+                # Store rewards from each reward function for each response in a group
                 rewards_per_func = torch.zeros(len(self.reward_funcs), self.args.num_generations, device=self.args.device)
                 
-                # 将输出转换成文本
+                # Convert output to text
                 response_texts = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
                 prompt_texts = [prompt] * len(response_texts)
                 prompt_response_texts = [prompt + response for prompt, response in zip(prompt_texts, response_texts)]
@@ -311,7 +315,7 @@ class GRPOTrainer:
                     self.args.reward_weights = [1.0] * len(self.reward_funcs)
                 if len(self.args.reward_weights) != len(self.reward_funcs):
                     raise ValueError("The number of reward weights must be equal to the number of reward functions.")
-                # 乘以各个奖励函数的权重
+                # Multiply by weights for each reward function
                 rewards = rewards_per_func * torch.tensor(self.args.reward_weights, dtype=torch.float32, device=rewards_per_func.device).unsqueeze(1)
                 
                 # rewards: [num_funcs, num_generations]
@@ -320,9 +324,9 @@ class GRPOTrainer:
                 mean_group_rewards = rewards.mean()
                 std_group_rewards = rewards.std()
                 
-                # 记录奖励到wandb
+                # Log rewards to wandb
                 if self.args.use_wandb:
-                    reward_func_names = ['correctness', 'digit', 'hard_format', 'mark']
+                    reward_func_names = ['correctness', 'box format']
                     for i in range(len(self.reward_funcs)):
                         func_name = reward_func_names[i] if i < len(reward_func_names) else f'reward_{i}'
                         wandb.log({
@@ -338,7 +342,7 @@ class GRPOTrainer:
                         'rewards_total/total_min': rewards.min().item(),
                     }, step=self.update_steps)
                 
-                # GRPO的优势是句子粒度的，而非token粒度的
+                # GRPO advantages are sentence-level, not token-level
                 advantages = (rewards - mean_group_rewards) / (std_group_rewards + 1e-8) # shape: [num_generations]
                 batch_advantages.append(advantages)
         
@@ -398,7 +402,7 @@ class GRPOTrainer:
 
     def get_action_log_probs(self, model, input_ids, attention_mask, num_actions):
         
-        # 计算策略模型输出token的概率
+        # Calculate token probabilities from policy model
         output = model(input_ids, attention_mask=attention_mask)
         logits = output.logits
         log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
@@ -424,7 +428,7 @@ class GRPOTrainer:
             # scaler.step(optimizer)
             # scaler.update()
         
-            # 记录到wandb
+            # Log to wandb
             if self.args.use_wandb:
                 wandb.log({
                     'train/loss': loss.item() * self.args.gradient_accumulation_steps,
@@ -463,9 +467,13 @@ class GRPOTrainer:
         self.model.save_pretrained(self.args.output_dir)
         self.tokenizer.save_pretrained(self.args.output_dir)
         
-        # 结束wandb运行
+        # Finish wandb run
         if self.args.use_wandb:
             wandb.finish()           
+
+
+
+
 
 if __name__ == "__main__":
 
